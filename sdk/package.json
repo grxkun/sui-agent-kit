@@ -1,0 +1,18 @@
+{
+  "name": "sui-agent-kit",
+  "version": "0.1.0",
+  "description": "Open-source middleware framework for agentic economics on the Sui blockchain",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch"
+  },
+  "dependencies": {
+    "@mysten/sui": "^1.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  },
+  "license": "Apache-2.0"
+}
