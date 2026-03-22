@@ -1,188 +1,96 @@
-/// sui_reputation — Stake-weighted reputation with attestation proofs.
-module sui_agent_kit::sui_reputation {
-    use sui::object::{Self, UID};
-    use sui::tx_context::{Self, TxContext};
-    use sui::transfer;
-    use sui::event;
-    use sui::clock::{Self, Clock};
-    use sui::balance::{Self, Balance};
-    use sui::coin::{Self, Coin};
-    use sui::sui::SUI;
-    use std::string::{Self, String};
+# Contributing
 
-    // ===== Error codes =====
-    const E_NOT_OWNER: u64 = 0;
-    const E_INVALID_RATING: u64 = 1;
-    const E_SELF_ATTEST: u64 = 2;
-    const E_INSUFFICIENT_STAKE: u64 = 3;
+Thanks for considering a contribution to sui-agent-kit.
 
-    // ===== Score weights =====
-    const WEIGHT_COMPLETED: u64 = 100;
-    const WEIGHT_DISPUTED: u64 = 250;
-    const BASE_SCORE: u64 = 500;
+---
 
-    // ===== Objects =====
+## Setup
 
-    /// Reputation record anchored to an agent identity.
-    public struct ReputationRecord has key, store {
-        id: UID,
-        agent_id: address,
-        stake: Balance<SUI>,
-        completed_tasks: u64,
-        disputed_tasks: u64,
-        score: u64,
-        total_earned: u64,
-    }
+```bash
+git clone https://github.com/grxkun/sui-agent-kit.git
+cd sui-agent-kit
+npm install
+```
 
-    /// Immutable attestation from one agent to another.
-    public struct Attestation has key, store {
-        id: UID,
-        from_agent: address,
-        to_agent: address,
-        task_id: address,
-        rating: u8,
-        proof_of_payment: address,
-        comment_blob: String,
-        timestamp: u64,
-    }
+You'll also need the [Sui CLI](https://docs.sui.io/build/install) to build and test Move contracts.
 
-    // ===== Events =====
+---
 
-    public struct ReputationInitialized has copy, drop {
-        record_id: address,
-        agent_id: address,
-        stake: u64,
-    }
+## Building
 
-    public struct AttestationCreated has copy, drop {
-        attestation_id: address,
-        from_agent: address,
-        to_agent: address,
-        rating: u8,
-        timestamp: u64,
-    }
+Move contracts:
 
-    public struct ScoreUpdated has copy, drop {
-        record_id: address,
-        new_score: u64,
-    }
+```bash
+cd move
+sui move build
+sui move test
+```
 
-    // ===== Public functions =====
+TypeScript SDK:
 
-    /// Initialize a reputation record with a stake.
-    public entry fun init_reputation(
-        agent_id: address,
-        stake: Coin<SUI>,
-        ctx: &mut TxContext,
-    ) {
-        let stake_value = coin::value(&stake);
+```bash
+cd sdk
+npm run build
+```
 
-        let record = ReputationRecord {
-            id: object::new(ctx),
-            agent_id,
-            stake: coin::into_balance(stake),
-            completed_tasks: 0,
-            disputed_tasks: 0,
-            score: BASE_SCORE,
-            total_earned: 0,
-        };
+---
 
-        let record_addr = object::uid_to_address(&record.id);
+## How the repo is structured
 
-        event::emit(ReputationInitialized {
-            record_id: record_addr,
-            agent_id,
-            stake: stake_value,
-        });
+The project has two layers that stay in sync:
 
-        transfer::share_object(record);
-    }
+- `move/sources/*.move` — 8 Move modules deployed as a single package to Sui.
+- `sdk/src/*.ts` — TypeScript SDK with one file per module, plus a unified `SuiAgentKit` class in `client.ts`.
+- `sdk/src/types.ts` — mirrors every Move struct. When you add a field to a Move struct, add the corresponding TypeScript type here.
 
-    /// Record a task completion (increases score).
-    public fun record_completion(record: &mut ReputationRecord, earned: u64) {
-        record.completed_tasks = record.completed_tasks + 1;
-        record.total_earned = record.total_earned + earned;
-        record.score = record.score + WEIGHT_COMPLETED;
+Each SDK module file (`agent.ts`, `policy.ts`, etc.) exports free functions. The `client.ts` class re-exposes them as `kit.agents.*`, `kit.policies.*`, etc.
 
-        event::emit(ScoreUpdated {
-            record_id: object::uid_to_address(&record.id),
-            new_score: record.score,
-        });
-    }
+---
 
-    /// Record a dispute (decreases score).
-    public fun record_dispute(record: &mut ReputationRecord) {
-        record.disputed_tasks = record.disputed_tasks + 1;
-        if (record.score >= WEIGHT_DISPUTED) {
-            record.score = record.score - WEIGHT_DISPUTED;
-        } else {
-            record.score = 0;
-        };
+## Conventions
 
-        event::emit(ScoreUpdated {
-            record_id: object::uid_to_address(&record.id),
-            new_score: record.score,
-        });
-    }
+**Move:**
+- All modules live under the `sui_agent_kit` address.
+- Error codes as constants at the top: `const E_NOT_OWNER: u64 = 0;`
+- Emit an event for every state mutation.
+- Use `Balance<SUI>` for escrow, `VecSet` for capability sets.
+- snake_case for module and function names, PascalCase for struct names.
 
-    /// Create an attestation from one agent to another.
-    public entry fun attest(
-        from_agent_id: address,
-        to_reputation_record: &mut ReputationRecord,
-        task_id: address,
-        rating: u8,
-        proof_of_payment_id: address,
-        comment_blob: vector<u8>,
-        clock: &Clock,
-        ctx: &mut TxContext,
-    ) {
-        assert!(rating >= 1 && rating <= 5, E_INVALID_RATING);
-        assert!(from_agent_id != to_reputation_record.agent_id, E_SELF_ATTEST);
+**TypeScript:**
+- Use `bigint` for all `u64` fields from Move.
+- Every public SDK function takes `(params, signer, client, packageId)` — the `SuiAgentKit` class wires these automatically.
+- Imports use `.js` extensions for ESM compatibility.
 
-        let now = clock::timestamp_ms(clock);
+---
 
-        // Update score based on rating
-        if (rating >= 4) {
-            to_reputation_record.score = to_reputation_record.score + ((rating as u64) * 10);
-        } else if (rating <= 2) {
-            let penalty = ((3 - (rating as u64)) * 15);
-            if (to_reputation_record.score >= penalty) {
-                to_reputation_record.score = to_reputation_record.score - penalty;
-            } else {
-                to_reputation_record.score = 0;
-            };
-        };
+## Making a change
 
-        let attestation = Attestation {
-            id: object::new(ctx),
-            from_agent: from_agent_id,
-            to_agent: to_reputation_record.agent_id,
-            task_id,
-            rating,
-            proof_of_payment: proof_of_payment_id,
-            comment_blob: string::utf8(comment_blob),
-            timestamp: now,
-        };
+1. Create a branch off `main`: `git checkout -b feat/your-feature`
+2. If adding a new Move module, also add the corresponding SDK file and wire it into `client.ts` and `index.ts`.
+3. If modifying a Move struct, update `types.ts` to match.
+4. Test your Move changes: `cd move && sui move test`
+5. Open a PR against `main`. One feature per PR.
 
-        let att_addr = object::uid_to_address(&attestation.id);
+---
 
-        event::emit(AttestationCreated {
-            attestation_id: att_addr,
-            from_agent: from_agent_id,
-            to_agent: to_reputation_record.agent_id,
-            rating,
-            timestamp: now,
-        });
+## What makes a good PR
 
-        transfer::freeze_object(attestation);
-    }
+- Small and focused. If you're adding a new module and fixing a bug, that's two PRs.
+- Includes Move tests for any new contract logic.
+- Updates the README module table if adding a new module.
+- Doesn't break existing SDK function signatures without a migration note.
 
-    // ===== View =====
+---
 
-    public fun score(record: &ReputationRecord): u64 { record.score }
-    public fun agent_id(record: &ReputationRecord): address { record.agent_id }
-    public fun stake_value(record: &ReputationRecord): u64 { balance::value(&record.stake) }
-    public fun completed_tasks(record: &ReputationRecord): u64 { record.completed_tasks }
-    public fun disputed_tasks(record: &ReputationRecord): u64 { record.disputed_tasks }
-    public fun total_earned(record: &ReputationRecord): u64 { record.total_earned }
-}
+## Reporting issues
+
+Open a GitHub issue. Include:
+- What you expected to happen
+- What actually happened
+- Steps to reproduce (testnet tx digests are helpful)
+
+---
+
+## License
+
+By contributing, you agree that your contributions will be licensed under the MIT license.
