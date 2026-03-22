@@ -1,205 +1,188 @@
-# sui-agent-kit
+/// sui_reputation — Stake-weighted reputation with attestation proofs.
+module sui_agent_kit::sui_reputation {
+    use sui::object::{Self, UID};
+    use sui::tx_context::{Self, TxContext};
+    use sui::transfer;
+    use sui::event;
+    use sui::clock::{Self, Clock};
+    use sui::balance::{Self, Balance};
+    use sui::coin::{Self, Coin};
+    use sui::sui::SUI;
+    use std::string::{Self, String};
 
-> Open-source middleware framework for agentic economics on the Sui blockchain
+    // ===== Error codes =====
+    const E_NOT_OWNER: u64 = 0;
+    const E_INVALID_RATING: u64 = 1;
+    const E_SELF_ATTEST: u64 = 2;
+    const E_INSUFFICIENT_STAKE: u64 = 3;
 
-sui-agent-kit provides composable on-chain modules that give AI agents first-class economic capabilities: identity, delegation, payments, reputation, task markets, payment streams, agent-to-agent messaging, and memory — all native to Sui's object model.
+    // ===== Score weights =====
+    const WEIGHT_COMPLETED: u64 = 100;
+    const WEIGHT_DISPUTED: u64 = 250;
+    const BASE_SCORE: u64 = 500;
 
-## Why Sui?
+    // ===== Objects =====
 
-| Sui Advantage | How We Use It |
-| --- | --- |
-| First-class objects | Every agent, task, policy, and message is an owned/shared object |
-| Parallel execution | Agents on disjoint state never block each other |
-| Programmable Transaction Blocks | Payment + instruction in one atomic transaction |
-| Walrus | Cheap verifiable blob storage for agent memory and payloads |
-| Balance\<T\> | Trustless escrow without external contracts |
+    /// Reputation record anchored to an agent identity.
+    public struct ReputationRecord has key, store {
+        id: UID,
+        agent_id: address,
+        stake: Balance<SUI>,
+        completed_tasks: u64,
+        disputed_tasks: u64,
+        score: u64,
+        total_earned: u64,
+    }
 
-## Module Map
+    /// Immutable attestation from one agent to another.
+    public struct Attestation has key, store {
+        id: UID,
+        from_agent: address,
+        to_agent: address,
+        task_id: address,
+        rating: u8,
+        proof_of_payment: address,
+        comment_blob: String,
+        timestamp: u64,
+    }
 
-| Module | Move Source | SDK File | Purpose |
-| --- | --- | --- | --- |
-| **Agent Identity** | `sui_agent_id.move` | `agent.ts` | On-chain identity registry (ERC-8004 equivalent) |
-| **Delegation Policy** | `sui_agent_policy.move` | `policy.ts` | Spending caps & authorization (Google AP2 equivalent) |
-| **x402 Payments** | `sui_x402.move` | `x402.ts` | HTTP 402 payment protocol for AI agents |
-| **Reputation** | `sui_reputation.move` | `reputation.ts` | Stake-weighted reputation + attestations |
-| **Task Market** | `sui_task_market.move` | `task.ts` | On-chain task posting, claiming, fulfillment |
-| **Payment Streams** | `sui_stream.move` | `stream.ts` | Epoch-based streaming payments |
-| **Agent-to-Agent** | `sui_a2a.move` | `a2a.ts` | Agent messaging protocol (Google A2A equivalent) |
-| **Memory** | `sui_memory.move` | `memory.ts` | Walrus-anchored agent memory layer |
+    // ===== Events =====
 
-## Comparison vs EVM Protocols
+    public struct ReputationInitialized has copy, drop {
+        record_id: address,
+        agent_id: address,
+        stake: u64,
+    }
 
-| Feature | EVM (x402/ERC-8004/AP2/A2A) | sui-agent-kit |
-| --- | --- | --- |
-| Agent Identity | ERC-8004 registry contract | First-class owned objects with VecSet capabilities |
-| Spending Caps | Google AP2 off-chain auth | On-chain DelegationCap with epoch-based daily limits |
-| Payments | x402 via ERC-20 approve/transfer | Coin\<SUI\> in PTBs, atomic escrow via Balance\<T\> |
-| Reputation | Off-chain or separate oracle | On-chain stake-weighted score with attestation proofs |
-| Task Market | Custom contracts | Shared TaskBoard with capability+reputation gating |
-| Streaming | Sablier/Superfluid | Native epoch-based streams with Balance\<SUI\> escrow |
-| Messaging | Google A2A HTTP | On-chain AgentMessage objects with payment attachment |
-| Memory | External DB / IPFS | Walrus blob + on-chain MemoryAnchor with integrity hash |
-| Parallelism | Sequential EVM execution | Sui parallel execution on disjoint objects |
-| Atomicity | Multi-contract calls via routers | Single PTB bundles all operations atomically |
+    public struct AttestationCreated has copy, drop {
+        attestation_id: address,
+        from_agent: address,
+        to_agent: address,
+        rating: u8,
+        timestamp: u64,
+    }
 
-## Quick Start
+    public struct ScoreUpdated has copy, drop {
+        record_id: address,
+        new_score: u64,
+    }
 
-### Prerequisites
+    // ===== Public functions =====
 
-* [Sui CLI](https://docs.sui.io/build/install) installed
-* Node.js >= 18
-* A Sui testnet account with SUI tokens
+    /// Initialize a reputation record with a stake.
+    public entry fun init_reputation(
+        agent_id: address,
+        stake: Coin<SUI>,
+        ctx: &mut TxContext,
+    ) {
+        let stake_value = coin::value(&stake);
 
-### 1. Deploy Move Contracts
+        let record = ReputationRecord {
+            id: object::new(ctx),
+            agent_id,
+            stake: coin::into_balance(stake),
+            completed_tasks: 0,
+            disputed_tasks: 0,
+            score: BASE_SCORE,
+            total_earned: 0,
+        };
 
-```bash
-cd move
-sui move build
-sui client publish --gas-budget 500000000
-```
+        let record_addr = object::uid_to_address(&record.id);
 
-Save the package ID from the output.
+        event::emit(ReputationInitialized {
+            record_id: record_addr,
+            agent_id,
+            stake: stake_value,
+        });
 
-### 2. Install SDK
+        transfer::share_object(record);
+    }
 
-```bash
-cd sdk
-npm install
-npm run build
-```
+    /// Record a task completion (increases score).
+    public fun record_completion(record: &mut ReputationRecord, earned: u64) {
+        record.completed_tasks = record.completed_tasks + 1;
+        record.total_earned = record.total_earned + earned;
+        record.score = record.score + WEIGHT_COMPLETED;
 
-### 3. Register an Agent
+        event::emit(ScoreUpdated {
+            record_id: object::uid_to_address(&record.id),
+            new_score: record.score,
+        });
+    }
 
-```ts
-import { getFullnodeUrl, SuiClient } from "@mysten/sui/client";
-import { Ed25519Keypair } from "@mysten/sui/keypairs/ed25519";
-import { SuiAgentKit } from "./sdk/src/index";
+    /// Record a dispute (decreases score).
+    public fun record_dispute(record: &mut ReputationRecord) {
+        record.disputed_tasks = record.disputed_tasks + 1;
+        if (record.score >= WEIGHT_DISPUTED) {
+            record.score = record.score - WEIGHT_DISPUTED;
+        } else {
+            record.score = 0;
+        };
 
-const client = new SuiClient({ url: getFullnodeUrl("testnet") });
-const keypair = Ed25519Keypair.fromSecretKey(YOUR_PRIVATE_KEY);
-const kit = new SuiAgentKit(keypair, {
-  packageId: PACKAGE_ID,
-  agentRegistryId: REGISTRY_ID,
-  taskBoardId: BOARD_ID,
-  network: "testnet",
-});
+        event::emit(ScoreUpdated {
+            record_id: object::uid_to_address(&record.id),
+            new_score: record.score,
+        });
+    }
 
-// Register agent with capabilities
-const result = await kit.agents.register({
-  name: "MyAgent",
-  capabilities: ["trade", "data", "delegate"],
-  endpointBlob: "walrus://my-agent-card",
-  x402Support: true,
-});
-```
+    /// Create an attestation from one agent to another.
+    public entry fun attest(
+        from_agent_id: address,
+        to_reputation_record: &mut ReputationRecord,
+        task_id: address,
+        rating: u8,
+        proof_of_payment_id: address,
+        comment_blob: vector<u8>,
+        clock: &Clock,
+        ctx: &mut TxContext,
+    ) {
+        assert!(rating >= 1 && rating <= 5, E_INVALID_RATING);
+        assert!(from_agent_id != to_reputation_record.agent_id, E_SELF_ATTEST);
 
-### 4. Post and Fulfill a Task
+        let now = clock::timestamp_ms(clock);
 
-```ts
-// Agent A posts a task
-await kit.tasks.post({
-  title: "Analyze Trading Data",
-  descriptionBlob: "walrus://task-desc",
-  rewardMist: 1_000_000_000n, // 1 SUI
-  requiredCapability: "data",
-  minReputationScore: 100n,
-  deadlineEpoch: 999999n,
-});
+        // Update score based on rating
+        if (rating >= 4) {
+            to_reputation_record.score = to_reputation_record.score + ((rating as u64) * 10);
+        } else if (rating <= 2) {
+            let penalty = ((3 - (rating as u64)) * 15);
+            if (to_reputation_record.score >= penalty) {
+                to_reputation_record.score = to_reputation_record.score - penalty;
+            } else {
+                to_reputation_record.score = 0;
+            };
+        };
 
-// Agent B claims and fulfills
-await kit.tasks.claim(taskId, agentBId, reputationId);
-await kit.tasks.fulfill(taskId, "walrus://result-blob");
+        let attestation = Attestation {
+            id: object::new(ctx),
+            from_agent: from_agent_id,
+            to_agent: to_reputation_record.agent_id,
+            task_id,
+            rating,
+            proof_of_payment: proof_of_payment_id,
+            comment_blob: string::utf8(comment_blob),
+            timestamp: now,
+        };
 
-// Agent A accepts → reward released
-await kit.tasks.accept(taskId);
-```
+        let att_addr = object::uid_to_address(&attestation.id);
 
-### 5. Send Agent-to-Agent Message
+        event::emit(AttestationCreated {
+            attestation_id: att_addr,
+            from_agent: from_agent_id,
+            to_agent: to_reputation_record.agent_id,
+            rating,
+            timestamp: now,
+        });
 
-```ts
-import { MessageIntent } from "./sdk/src/types";
+        transfer::freeze_object(attestation);
+    }
 
-await kit.messages.send({
-  senderAgentCardId: MY_AGENT_ID,
-  recipient: OTHER_AGENT_ADDRESS,
-  intent: MessageIntent.Request,
-  payloadBlob: "walrus://request-payload",
-  paymentMist: 500_000_000n, // 0.5 SUI attached
-  ttlEpoch: 100n,
-  requiresAck: true,
-});
-```
+    // ===== View =====
 
-### 6. HTTP 402 Payment Middleware
-
-```ts
-import express from "express";
-
-const app = express();
-
-// Auto-pay 402 requests up to 0.1 SUI
-app.use(kit.payments.middleware({ maxAmount: 100_000_000 }));
-```
-
-## Project Structure
-
-```
-sui-agent-kit/
-├── move/
-│   ├── Move.toml
-│   └── sources/
-│       ├── sui_agent_id.move      # Agent identity
-│       ├── sui_agent_policy.move  # Delegation policies
-│       ├── sui_x402.move          # x402 payments
-│       ├── sui_reputation.move    # Reputation system
-│       ├── sui_task_market.move   # Task marketplace
-│       ├── sui_stream.move        # Payment streams
-│       ├── sui_a2a.move           # Agent messaging
-│       └── sui_memory.move        # Memory anchoring
-├── sdk/
-│   ├── package.json
-│   ├── tsconfig.json
-│   └── src/
-│       ├── index.ts               # Re-exports everything
-│       ├── types.ts               # TypeScript type mirrors
-│       ├── client.ts              # SuiAgentKit main class
-│       ├── agent.ts               # Agent identity SDK
-│       ├── policy.ts              # Delegation policy SDK
-│       ├── x402.ts                # x402 payment SDK
-│       ├── reputation.ts          # Reputation SDK
-│       ├── task.ts                # Task market SDK
-│       ├── stream.ts              # Payment stream SDK
-│       ├── a2a.ts                 # Agent messaging SDK
-│       └── memory.ts              # Memory SDK
-├── examples/
-│   ├── register-agent/index.ts
-│   └── post-and-fulfill-task/index.ts
-├── .github/
-│   └── copilot-instructions.md
-├── LICENSE
-└── README.md
-```
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────┐
-│                   AI Agent Application               │
-├─────────────────────────────────────────────────────┤
-│                 TypeScript SDK (sdk/src/)             │
-│  SuiAgentKit.agents | .policies | .payments | ...    │
-├─────────────────────────────────────────────────────┤
-│           Programmable Transaction Blocks (PTBs)      │
-├────────┬────────┬────────┬────────┬────────┬────────┤
-│Identity│Policy  │x402    │Reputa- │Tasks   │Streams │
-│        │        │        │tion    │        │        │
-├────────┴────────┴────────┴────────┴────────┴────────┤
-│              Sui Blockchain (Move Modules)            │
-├─────────────────────────────────────────────────────┤
-│         Walrus (Blob Storage) + Ika/MCP (Compute)    │
-└─────────────────────────────────────────────────────┘
-```
-
-## License
-
-MIT
+    public fun score(record: &ReputationRecord): u64 { record.score }
+    public fun agent_id(record: &ReputationRecord): address { record.agent_id }
+    public fun stake_value(record: &ReputationRecord): u64 { balance::value(&record.stake) }
+    public fun completed_tasks(record: &ReputationRecord): u64 { record.completed_tasks }
+    public fun disputed_tasks(record: &ReputationRecord): u64 { record.disputed_tasks }
+    public fun total_earned(record: &ReputationRecord): u64 { record.total_earned }
+}

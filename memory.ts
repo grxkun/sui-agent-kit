@@ -1,115 +1,57 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// agent.ts — Agent identity SDK (wraps sui_agent_id.move)
+// examples/register-agent/index.ts
+// Register an agent and create a delegation cap
+// Run: npx ts-node examples/register-agent/index.ts
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { SuiClient } from '@mysten/sui/client';
-import { Transaction } from '@mysten/sui/transactions';
-import type { Keypair } from '@mysten/sui/cryptography';
-import type { RegisterAgentParams, AgentCard } from './types.js';
+import { SuiAgentKit } from '../../sdk/src/index.js';
+import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
+import { SuiClient, getFullnodeUrl } from '@mysten/sui/client';
 
-const CLOCK = '0x6';
+async function main() {
+  const keypair = Ed25519Keypair.fromSecretKey(
+    Uint8Array.from(Buffer.from(process.env.SUI_PRIVATE_KEY!, 'hex'))
+  );
 
-function toBytes(s: string): number[] {
-  return Array.from(new TextEncoder().encode(s));
-}
-
-export async function registerAgent(
-  params: RegisterAgentParams,
-  signer: Keypair,
-  client: SuiClient,
-  packageId: string,
-) {
-  const tx = new Transaction();
-
-  const capBytes = params.capabilities.map((c) => tx.pure.vector('u8', toBytes(c)));
-
-  tx.moveCall({
-    target: `${packageId}::sui_agent_id::register`,
-    arguments: [
-      tx.object(/* registryId passed via config — caller wraps */),
-      tx.pure.vector('u8', toBytes(params.name)),
-      tx.makeMoveVec({ elements: capBytes }),
-      tx.pure.vector('u8', toBytes(params.endpointBlob)),
-      tx.pure.vector('u8', toBytes(params.mcpEndpoint ?? '')),
-      tx.pure.bool(params.x402Support ?? false),
-      tx.object(CLOCK),
-    ],
+  const kit = new SuiAgentKit(keypair, {
+    packageId: process.env.PACKAGE_ID!,
+    agentRegistryId: process.env.AGENT_REGISTRY_ID!,
+    taskBoardId: process.env.TASK_BOARD_ID!,
+    network: 'testnet',
   });
 
-  return client.signAndExecuteTransaction({
-    signer,
-    transaction: tx,
-    options: { showEffects: true, showObjectChanges: true },
-  });
-}
-
-export async function getAgent(
-  client: SuiClient,
-  agentId: string,
-): Promise<AgentCard | null> {
-  try {
-    const obj = await client.getObject({
-      id: agentId,
-      options: { showContent: true },
-    });
-
-    if (!obj.data?.content || obj.data.content.dataType !== 'moveObject') {
-      return null;
-    }
-
-    const f = obj.data.content.fields as Record<string, any>;
-    return {
-      id: agentId,
-      owner: f.owner,
-      name: f.name,
-      version: BigInt(f.version),
-      capabilities: f.capabilities?.contents ?? [],
-      endpointBlob: f.endpoint_blob,
-      mcpEndpoint: f.mcp_endpoint || null,
-      x402Support: f.x402_support,
-      active: f.active,
-      createdAt: BigInt(f.created_at),
-    };
-  } catch {
-    return null;
-  }
-}
-
-export async function hasCapability(
-  client: SuiClient,
-  agentId: string,
-  capability: string,
-): Promise<boolean> {
-  const agent = await getAgent(client, agentId);
-  if (!agent) return false;
-  return agent.capabilities.includes(capability);
-}
-
-export async function listAgentsByOwner(
-  client: SuiClient,
-  owner: string,
-): Promise<AgentCard[]> {
-  const { data } = await client.getOwnedObjects({
-    owner,
-    filter: { StructType: `${owner}::sui_agent_id::AgentCard` },
-    options: { showContent: true },
+  // Register
+  console.log('📋 Registering agent...');
+  const result = await kit.agents.register({
+    name: 'DataBot v1',
+    capabilities: ['data_analysis', 'trade', 'delegate'],
+    endpointBlob: 'bafkreigh2akiscaild',
+    mcpEndpoint: 'https://your-mcp.example.com/ika',
+    x402Support: true,
   });
 
-  return data
-    .filter((o) => o.data?.content?.dataType === 'moveObject')
-    .map((o) => {
-      const f = (o.data!.content as any).fields;
-      return {
-        id: o.data!.objectId,
-        owner: f.owner,
-        name: f.name,
-        version: BigInt(f.version),
-        capabilities: f.capabilities?.contents ?? [],
-        endpointBlob: f.endpoint_blob,
-        mcpEndpoint: f.mcp_endpoint || null,
-        x402Support: f.x402_support,
-        active: f.active,
-        createdAt: BigInt(f.created_at),
-      };
-    });
+  const agentCardId = result.effects?.created?.[0]?.reference?.objectId;
+  console.log('✅ Agent registered:', agentCardId);
+
+  // Create delegation cap
+  const client = new SuiClient({ url: getFullnodeUrl('testnet') });
+  const { epoch } = await client.getLatestSuiSystemState();
+
+  const capResult = await kit.policies.createCap({
+    agentId: agentCardId!,
+    allowedModules: ['deepbook', 'navi', 'cetus'],
+    maxPerTx: 100_000_000n,
+    dailyLimit: 1_000_000_000n,
+    expiryEpoch: BigInt(Number(epoch) + 100),
+    revocable: true,
+  });
+
+  const capId = capResult.effects?.created?.[0]?.reference?.objectId;
+  console.log('✅ DelegationCap created:', capId);
+
+  console.log('\n📌 Add to .env:');
+  console.log(`AGENT_CARD_ID=${agentCardId}`);
+  console.log(`DELEGATION_CAP_ID=${capId}`);
 }
+
+main().catch(console.error);

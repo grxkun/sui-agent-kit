@@ -1,198 +1,155 @@
-/// sui_agent_policy — Delegation policies with spending caps.
-/// Google AP2 equivalent: on-chain DelegationCap with epoch-based daily limits.
-module sui_agent_kit::sui_agent_policy {
-    use sui::object::{Self, UID};
-    use sui::tx_context::{Self, TxContext};
-    use sui::transfer;
-    use sui::event;
-    use sui::clock::{Self, Clock};
-    use sui::vec_set::{Self, VecSet};
-    use sui::table::{Self, Table};
-    use std::string::{Self, String};
-    use std::vector;
+# sui-agent-kit
 
-    // ===== Error codes =====
-    const E_NOT_DELEGATOR: u64 = 0;
-    const E_CAP_EXPIRED: u64 = 1;
-    const E_CAP_REVOKED: u64 = 2;
-    const E_MODULE_NOT_ALLOWED: u64 = 3;
-    const E_EXCEEDS_PER_TX: u64 = 4;
-    const E_EXCEEDS_DAILY: u64 = 5;
-    const E_NOT_REVOCABLE: u64 = 6;
+The missing middleware layer between Sui's L1 primitives and real-world AI agent applications.
 
-    // ===== Objects =====
+Eight composable Move modules and a unified TypeScript SDK that give agents economic agency on-chain: identity, delegation, payments, reputation, task markets, streaming, messaging, and memory.
 
-    /// A delegation capability granting an agent constrained authority.
-    public struct DelegationCap has key, store {
-        id: UID,
-        agent_id: address,
-        delegator: address,
-        allowed_modules: VecSet<String>,
-        max_per_tx: u64,
-        daily_limit: u64,
-        expiry_epoch: u64,
-        revocable: bool,
-        active: bool,
-    }
+---
 
-    /// Tracks daily spend per DelegationCap per epoch.
-    public struct SpendRecord has key {
-        id: UID,
-        cap_id: address,
-        epoch: u64,
-        spent_today: u64,
-    }
+## The idea
 
-    // ===== Events =====
+On EVM, agent infrastructure is scattered across disconnected protocols — x402 for payments, ERC-8004 for identity, Google AP2 for delegation, A2A for messaging. Each lives in its own repo, its own runtime, its own trust model.
 
-    public struct DelegationCreated has copy, drop {
-        cap_id: address,
-        agent_id: address,
-        delegator: address,
-        max_per_tx: u64,
-        daily_limit: u64,
-    }
+sui-agent-kit consolidates all of this into a single package deployed to Sui. Every agent, task, policy, and message is a first-class Sui object. Every operation — payment, delegation check, task assignment — composes inside a single Programmable Transaction Block. No routers, no multi-contract hops, no sequential bottlenecks.
 
-    public struct DelegationRevoked has copy, drop {
-        cap_id: address,
-        delegator: address,
-    }
+The canonical flow:
 
-    public struct SpendRecorded has copy, drop {
-        cap_id: address,
-        module_name: String,
-        amount: u64,
-        epoch: u64,
-    }
+```
+register → delegate → authorize → execute → attest → settle
+```
 
-    // ===== Public functions =====
+---
 
-    /// Create a new DelegationCap for an agent.
-    public entry fun create_delegation_cap(
-        agent_id: address,
-        allowed_modules: vector<vector<u8>>,
-        max_per_tx: u64,
-        daily_limit: u64,
-        expiry_epoch: u64,
-        revocable: bool,
-        ctx: &mut TxContext,
-    ) {
-        let delegator = tx_context::sender(ctx);
+## Modules
 
-        let mut module_set = vec_set::empty<String>();
-        let mut i = 0;
-        let len = vector::length(&allowed_modules);
-        while (i < len) {
-            vec_set::insert(&mut module_set, string::utf8(*vector::borrow(&allowed_modules, i)));
-            i = i + 1;
-        };
+```
+move/sources/
+  sui_agent_id.move         Identity registry. VecSet capabilities, Walrus endpoint.
+  sui_agent_policy.move     DelegationCap with per-tx limits, daily budgets, epoch expiry.
+  sui_x402.move             HTTP 402 payment requests. Atomic fulfill, frozen receipts.
+  sui_reputation.move       Stake-weighted scoring. Attestation proofs between agents.
+  sui_task_market.move      Shared TaskBoard. Escrow via Balance<SUI>, reputation gating.
+  sui_stream.move           Epoch-based streaming payments. Open, claim, top-up, close.
+  sui_a2a.move              Agent-to-agent messages with attached SUI payment and TTL.
+  sui_memory.move           Walrus-anchored memory. Content hash verification on-chain.
+```
 
-        let cap = DelegationCap {
-            id: object::new(ctx),
-            agent_id,
-            delegator,
-            allowed_modules: module_set,
-            max_per_tx,
-            daily_limit,
-            expiry_epoch,
-            revocable,
-            active: true,
-        };
+```
+sdk/src/
+  client.ts                 SuiAgentKit — unified entry point.
+  agent.ts                  kit.agents.register() / .get() / .hasCapability()
+  policy.ts                 kit.policies.createCap() / .revoke() / .checkAuthorization()
+  x402.ts                   kit.payments.createRequest() / .fulfill() / .middleware()
+  reputation.ts             kit.reputation.init() / .attest() / .getScore()
+  task.ts                   kit.tasks.post() / .claim() / .fulfill() / .accept()
+  stream.ts                 kit.streams.open() / .claim() / .topUp() / .close()
+  a2a.ts                    kit.messages.send() / .acknowledge() / .getInbox()
+  memory.ts                 kit.memory.store() / .get() / .verify() / .uploadToWalrus()
+```
 
-        let cap_addr = object::uid_to_address(&cap.id);
+---
 
-        event::emit(DelegationCreated {
-            cap_id: cap_addr,
-            agent_id,
-            delegator,
-            max_per_tx,
-            daily_limit,
-        });
+## Why Sui and not EVM
 
-        transfer::transfer(cap, delegator);
-    }
+Sui objects are owned or shared — agents on disjoint state execute in parallel. `Balance<SUI>` gives you trustless escrow without a separate vault contract. PTBs bundle an entire workflow atomically: split coin, check policy, post task, attach payment, emit event — one transaction, one gas fee.
 
-    /// Revoke a delegation cap (delegator only, must be revocable).
-    public entry fun revoke(
-        cap: &mut DelegationCap,
-        ctx: &mut TxContext,
-    ) {
-        assert!(cap.delegator == tx_context::sender(ctx), E_NOT_DELEGATOR);
-        assert!(cap.revocable, E_NOT_REVOCABLE);
-        assert!(cap.active, E_CAP_REVOKED);
+Walrus handles the heavy payloads. Move handles the trust. The SDK handles the wiring.
 
-        cap.active = false;
+---
 
-        event::emit(DelegationRevoked {
-            cap_id: object::uid_to_address(&cap.id),
-            delegator: cap.delegator,
-        });
-    }
+## Get started
 
-    /// Check authorization: is this module/amount allowed under the cap?
-    /// Also records spend. Aborts if not authorized.
-    public fun authorize_and_record(
-        cap: &mut DelegationCap,
-        record: &mut SpendRecord,
-        module_name: String,
-        amount: u64,
-        ctx: &mut TxContext,
-    ): bool {
-        assert!(cap.active, E_CAP_REVOKED);
+Deploy the contracts:
 
-        let current_epoch = tx_context::epoch(ctx);
-        assert!(current_epoch <= cap.expiry_epoch, E_CAP_EXPIRED);
+```bash
+cd move && sui move build && sui client publish --gas-budget 500000000
+```
 
-        // Check module allowlist
-        assert!(vec_set::contains(&cap.allowed_modules, &module_name), E_MODULE_NOT_ALLOWED);
+Build the SDK:
 
-        // Check per-tx limit
-        assert!(amount <= cap.max_per_tx, E_EXCEEDS_PER_TX);
+```bash
+cd sdk && npm install && npm run build
+```
 
-        // Reset spend record if new epoch
-        if (record.epoch < current_epoch) {
-            record.epoch = current_epoch;
-            record.spent_today = 0;
-        };
+Register an agent:
 
-        // Check daily limit
-        assert!(record.spent_today + amount <= cap.daily_limit, E_EXCEEDS_DAILY);
+```ts
+import { SuiAgentKit } from "./sdk/src/index";
+import { Ed25519Keypair } from "@mysten/sui/keypairs/ed25519";
 
-        // Record spend
-        record.spent_today = record.spent_today + amount;
+const kit = new SuiAgentKit(keypair, {
+  packageId: "0x...",
+  agentRegistryId: "0x...",
+  taskBoardId: "0x...",
+  network: "testnet",
+});
 
-        event::emit(SpendRecorded {
-            cap_id: object::uid_to_address(&cap.id),
-            module_name,
-            amount,
-            epoch: current_epoch,
-        });
+await kit.agents.register({
+  name: "TraderBot",
+  capabilities: ["trade", "data", "delegate"],
+  endpointBlob: "walrus://agent-card",
+  x402Support: true,
+});
+```
 
-        true
-    }
+Post a task, fulfill it, settle:
 
-    /// Create a SpendRecord for a new cap.
-    public entry fun init_spend_record(
-        cap_id: address,
-        ctx: &mut TxContext,
-    ) {
-        let record = SpendRecord {
-            id: object::new(ctx),
-            cap_id,
-            epoch: tx_context::epoch(ctx),
-            spent_today: 0,
-        };
-        transfer::share_object(record);
-    }
+```ts
+await kit.tasks.post({
+  title: "Analyze order flow",
+  descriptionBlob: "walrus://task-spec",
+  rewardMist: 1_000_000_000n,
+  requiredCapability: "data",
+  deadlineEpoch: 999999n,
+});
 
-    // ===== View =====
+await kit.tasks.claim(taskId, agentId, reputationId);
+await kit.tasks.fulfill(taskId, "walrus://result");
+await kit.tasks.accept(taskId); // releases escrow
+```
 
-    public fun is_active(cap: &DelegationCap): bool { cap.active }
-    public fun agent_id(cap: &DelegationCap): address { cap.agent_id }
-    public fun delegator(cap: &DelegationCap): address { cap.delegator }
-    public fun max_per_tx(cap: &DelegationCap): u64 { cap.max_per_tx }
-    public fun daily_limit(cap: &DelegationCap): u64 { cap.daily_limit }
-    public fun expiry_epoch(cap: &DelegationCap): u64 { cap.expiry_epoch }
-    public fun spent_today(record: &SpendRecord): u64 { record.spent_today }
-    public fun record_epoch(record: &SpendRecord): u64 { record.epoch }
-}
+Send a paid message between agents:
+
+```ts
+await kit.messages.send({
+  senderAgentCardId: myAgentId,
+  recipient: otherAgent,
+  intent: MessageIntent.Request,
+  payloadBlob: "walrus://payload",
+  paymentMist: 500_000_000n,
+  ttlEpoch: 100n,
+  requiresAck: true,
+});
+```
+
+---
+
+## EVM equivalence
+
+| Concern | EVM | sui-agent-kit |
+|---|---|---|
+| Identity | ERC-8004 registry | `AgentCard` owned objects, `VecSet` capabilities |
+| Delegation | AP2 off-chain auth | `DelegationCap` with on-chain epoch budgets |
+| Payments | x402 + ERC-20 approve | `Coin<SUI>` in PTBs, `Balance<T>` escrow |
+| Reputation | Off-chain oracles | Stake-weighted `ReputationRecord` + frozen `Attestation` |
+| Tasks | Custom contracts | `TaskBoard` shared object, escrow + gating |
+| Streaming | Sablier / Superfluid | `PaymentStream` with epoch-rate claims |
+| Messaging | A2A over HTTP | `AgentMessage` objects with payment + TTL |
+| Memory | IPFS + external DB | Walrus blob + `MemoryAnchor` hash verification |
+
+---
+
+## Project structure
+
+```
+move/sources/         8 Move modules — the on-chain layer
+sdk/src/              TypeScript SDK — wraps every module
+examples/             Working examples for testnet
+.github/              Copilot instructions, CI
+```
+
+---
+
+## License
+
+MIT
