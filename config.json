@@ -1,11 +1,224 @@
-{
-  "$schema": "https://unpkg.com/@changesets/config@3.0.0/schema.json",
-  "changelog": "@changesets/cli/changelog",
-  "commit": false,
-  "fixed": [],
-  "linked": [],
-  "access": "public",
-  "baseBranch": "main",
-  "updateInternalDependencies": "patch",
-  "ignore": []
+// ─────────────────────────────────────────────────────────────────────────────
+// task.ts — Task market SDK (wraps sui_task_market.move)
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { SuiClient } from '@mysten/sui/client';
+import { Transaction } from '@mysten/sui/transactions';
+import type { Keypair } from '@mysten/sui/cryptography';
+import type { PostTaskParams, Task } from './types.js';
+import { TaskStatus } from './types.js';
+
+function toBytes(s: string): number[] {
+  return Array.from(new TextEncoder().encode(s));
+}
+
+export async function postTask(
+  params: PostTaskParams,
+  signer: Keypair,
+  client: SuiClient,
+  packageId: string,
+  boardId: string,
+) {
+  const tx = new Transaction();
+  const [reward] = tx.splitCoins(tx.gas, [Number(params.rewardMist)]);
+
+  tx.moveCall({
+    target: `${packageId}::sui_task_market::post_task`,
+    arguments: [
+      tx.object(boardId),
+      tx.pure.vector('u8', toBytes(params.title)),
+      tx.pure.vector('u8', toBytes(params.descriptionBlob)),
+      reward,
+      tx.pure.vector('u8', toBytes(params.requiredCapability)),
+      tx.pure.u64(params.minReputationScore ?? 0n),
+      tx.pure.u64(params.deadlineEpoch),
+    ],
+  });
+
+  return client.signAndExecuteTransaction({
+    signer,
+    transaction: tx,
+    options: { showEffects: true, showObjectChanges: true },
+  });
+}
+
+export async function claimTask(
+  taskId: string,
+  agentId: string,
+  reputationId: string,
+  signer: Keypair,
+  client: SuiClient,
+  packageId: string,
+) {
+  // Reputation check happens off-chain; on-chain just claims
+  const tx = new Transaction();
+
+  tx.moveCall({
+    target: `${packageId}::sui_task_market::claim_task`,
+    arguments: [
+      // boardId is resolved from config in client.ts wrapper
+      tx.object(taskId),
+    ],
+  });
+
+  return client.signAndExecuteTransaction({
+    signer,
+    transaction: tx,
+    options: { showEffects: true },
+  });
+}
+
+export async function fulfillTask(
+  taskId: string,
+  resultBlob: string,
+  signer: Keypair,
+  client: SuiClient,
+  packageId: string,
+) {
+  const tx = new Transaction();
+
+  tx.moveCall({
+    target: `${packageId}::sui_task_market::fulfill_task`,
+    arguments: [
+      tx.object(taskId),
+      tx.pure.vector('u8', toBytes(resultBlob)),
+    ],
+  });
+
+  return client.signAndExecuteTransaction({
+    signer,
+    transaction: tx,
+    options: { showEffects: true },
+  });
+}
+
+export async function acceptResult(
+  taskId: string,
+  signer: Keypair,
+  client: SuiClient,
+  packageId: string,
+) {
+  const tx = new Transaction();
+
+  tx.moveCall({
+    target: `${packageId}::sui_task_market::accept_result`,
+    arguments: [tx.object(taskId)],
+  });
+
+  return client.signAndExecuteTransaction({
+    signer,
+    transaction: tx,
+    options: { showEffects: true },
+  });
+}
+
+export async function disputeTask(
+  taskId: string,
+  signer: Keypair,
+  client: SuiClient,
+  packageId: string,
+) {
+  const tx = new Transaction();
+
+  tx.moveCall({
+    target: `${packageId}::sui_task_market::dispute_task`,
+    arguments: [tx.object(taskId)],
+  });
+
+  return client.signAndExecuteTransaction({
+    signer,
+    transaction: tx,
+    options: { showEffects: true },
+  });
+}
+
+export async function getOpenTasks(
+  client: SuiClient,
+  boardId: string,
+  capability?: string,
+): Promise<Task[]> {
+  // Query events for open tasks (simplified — production would use an indexer)
+  const { data } = await client.queryEvents({
+    query: { MoveEventType: `::sui_task_market::TaskPosted` },
+    limit: 50,
+    order: 'descending',
+  });
+
+  // Fetch each task object to check status
+  const tasks: Task[] = [];
+  for (const ev of data) {
+    const fields = ev.parsedJson as Record<string, any>;
+    try {
+      const obj = await client.getObject({
+        id: fields.task_id,
+        options: { showContent: true },
+      });
+      const f = (obj.data?.content as any)?.fields;
+      if (f && Number(f.status) === TaskStatus.Open) {
+        if (!capability || f.required_capability === capability) {
+          tasks.push({
+            id: fields.task_id,
+            poster: f.poster,
+            title: f.title,
+            descriptionBlob: f.description_blob,
+            reward: BigInt(f.reward?.value ?? 0),
+            requiredCapability: f.required_capability,
+            minReputationScore: BigInt(f.min_reputation_score),
+            deadlineEpoch: BigInt(f.deadline_epoch),
+            status: TaskStatus.Open,
+            assignedAgent: null,
+            resultBlob: null,
+          });
+        }
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  return tasks;
+}
+
+export async function getTasksByAgent(
+  client: SuiClient,
+  agentId: string,
+): Promise<Task[]> {
+  const { data } = await client.queryEvents({
+    query: { MoveEventType: `::sui_task_market::TaskClaimed` },
+    limit: 50,
+    order: 'descending',
+  });
+
+  const tasks: Task[] = [];
+  for (const ev of data) {
+    const fields = ev.parsedJson as Record<string, any>;
+    if (fields.agent === agentId) {
+      try {
+        const obj = await client.getObject({
+          id: fields.task_id,
+          options: { showContent: true },
+        });
+        const f = (obj.data?.content as any)?.fields;
+        if (f) {
+          tasks.push({
+            id: fields.task_id,
+            poster: f.poster,
+            title: f.title,
+            descriptionBlob: f.description_blob,
+            reward: BigInt(f.reward?.value ?? 0),
+            requiredCapability: f.required_capability,
+            minReputationScore: BigInt(f.min_reputation_score),
+            deadlineEpoch: BigInt(f.deadline_epoch),
+            status: Number(f.status) as TaskStatus,
+            assignedAgent: f.assigned_agent,
+            resultBlob: f.result_blob || null,
+          });
+        }
+      } catch {
+        continue;
+      }
+    }
+  }
+
+  return tasks;
 }

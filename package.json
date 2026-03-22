@@ -1,128 +1,41 @@
-{
-  "name": "@sui-agent-kit/sdk",
-  "version": "0.1.0",
-  "description": "The missing middleware layer for agentic economics on Sui. Move modules + TypeScript SDK for AI agents to register, earn, delegate, and coordinate on-chain.",
-  "author": "sui-agent-kit contributors",
-  "license": "Apache-2.0",
-  "homepage": "https://github.com/YOUR_USERNAME/sui-agent-kit#readme",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/YOUR_USERNAME/sui-agent-kit.git",
-    "directory": "sdk"
-  },
-  "bugs": {
-    "url": "https://github.com/YOUR_USERNAME/sui-agent-kit/issues"
-  },
-  "keywords": [
-    "sui",
-    "move",
-    "ai-agents",
-    "agentic",
-    "blockchain",
-    "x402",
-    "defi",
-    "web3",
-    "agent-economy",
-    "micropayments",
-    "task-market",
-    "delegation"
-  ],
-  "type": "module",
-  "main": "./dist/index.cjs",
-  "module": "./dist/index.js",
-  "types": "./dist/index.d.ts",
-  "exports": {
-    ".": {
-      "import": {
-        "types": "./dist/index.d.ts",
-        "default": "./dist/index.js"
-      },
-      "require": {
-        "types": "./dist/index.d.cts",
-        "default": "./dist/index.cjs"
-      }
-    },
-    "./agent": {
-      "import": "./dist/agent.js",
-      "require": "./dist/agent.cjs"
-    },
-    "./policy": {
-      "import": "./dist/policy.js",
-      "require": "./dist/policy.cjs"
-    },
-    "./x402": {
-      "import": "./dist/x402.js",
-      "require": "./dist/x402.cjs"
-    },
-    "./reputation": {
-      "import": "./dist/reputation.js",
-      "require": "./dist/reputation.cjs"
-    },
-    "./task": {
-      "import": "./dist/task.js",
-      "require": "./dist/task.cjs"
-    },
-    "./stream": {
-      "import": "./dist/stream.js",
-      "require": "./dist/stream.cjs"
-    },
-    "./a2a": {
-      "import": "./dist/a2a.js",
-      "require": "./dist/a2a.cjs"
-    },
-    "./memory": {
-      "import": "./dist/memory.js",
-      "require": "./dist/memory.cjs"
-    }
-  },
-  "files": [
-    "dist",
-    "README.md",
-    "LICENSE"
-  ],
-  "scripts": {
-    "build": "tsup",
-    "build:watch": "tsup --watch",
-    "test": "vitest run",
-    "test:watch": "vitest",
-    "test:coverage": "vitest run --coverage",
-    "lint": "eslint src --ext .ts",
-    "format": "prettier --write src/**/*.ts",
-    "format:check": "prettier --check src/**/*.ts",
-    "typecheck": "tsc --noEmit",
-    "prepublishOnly": "pnpm build && pnpm typecheck",
-    "release": "pnpm build && changeset publish"
-  },
-  "dependencies": {
-    "@mysten/sui": "^1.0.0",
-    "@mysten/walrus": "^0.1.0"
-  },
-  "devDependencies": {
-    "@changesets/cli": "^2.27.0",
-    "@types/express": "^4.17.21",
-    "@types/node": "^20.0.0",
-    "@typescript-eslint/eslint-plugin": "^7.0.0",
-    "@typescript-eslint/parser": "^7.0.0",
-    "@vitest/coverage-v8": "^1.0.0",
-    "eslint": "^8.57.0",
-    "prettier": "^3.2.0",
-    "tsup": "^8.0.0",
-    "typescript": "^5.4.0",
-    "vitest": "^1.0.0"
-  },
-  "peerDependencies": {
-    "express": ">=4.18.0"
-  },
-  "peerDependenciesMeta": {
-    "express": {
-      "optional": true
-    }
-  },
-  "engines": {
-    "node": ">=18.0.0"
-  },
-  "publishConfig": {
-    "access": "public",
-    "registry": "https://registry.npmjs.org/"
-  }
-}
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [18, 20]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+
+  move-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Sui CLI
+        run: |
+          curl -fsSL https://sui.io/install.sh | bash
+          echo "$HOME/.sui/bin" >> $GITHUB_PATH
+
+      - name: Build Move
+        run: cd move && sui move build
+
+      - name: Test Move
+        run: cd move && sui move test

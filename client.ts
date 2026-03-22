@@ -1,172 +1,20 @@
-// ─────────────────────────────────────────────────────────────────────────────
-// client.ts — SuiAgentKit: unified access to all modules
-// ─────────────────────────────────────────────────────────────────────────────
-
-import { SuiClient, getFullnodeUrl } from '@mysten/sui/client';
-import type { Keypair } from '@mysten/sui/cryptography';
-import type { SuiAgentKitConfig } from './types.js';
-
-import * as AgentModule     from './agent.js';
-import * as PolicyModule    from './policy.js';
-import * as X402Module      from './x402.js';
-import * as ReputationModule from './reputation.js';
-import * as TaskModule      from './task.js';
-import * as StreamModule    from './stream.js';
-import * as A2AModule       from './a2a.js';
-import * as MemoryModule    from './memory.js';
-
-export class SuiAgentKit {
-  readonly client: SuiClient;
-  readonly signer: Keypair;
-  readonly config: SuiAgentKitConfig;
-
-  constructor(signer: Keypair, config: SuiAgentKitConfig) {
-    this.signer = signer;
-    this.config = config;
-    this.client = new SuiClient({
-      url: config.network === 'mainnet'
-        ? getFullnodeUrl('mainnet')
-        : config.network === 'testnet'
-          ? getFullnodeUrl('testnet')
-          : 'http://127.0.0.1:9000',
-    });
-  }
-
-  // ── Agent identity ──────────────────────────────────────────────────────────
-
-  get agents() {
-    const { client, signer, config } = this;
-    return {
-      register: (params: Parameters<typeof AgentModule.registerAgent>[0]) =>
-        AgentModule.registerAgent(params, signer, client, config.packageId),
-      get: (agentId: string) =>
-        AgentModule.getAgent(client, agentId),
-      hasCapability: (agentId: string, capability: string) =>
-        AgentModule.hasCapability(client, agentId, capability),
-      listByOwner: (owner: string) =>
-        AgentModule.listAgentsByOwner(client, owner),
-    };
-  }
-
-  // ── Delegation & policy ─────────────────────────────────────────────────────
-
-  get policies() {
-    const { client, signer, config } = this;
-    return {
-      createCap: (params: Parameters<typeof PolicyModule.createDelegationCap>[0]) =>
-        PolicyModule.createDelegationCap(params, signer, client, config.packageId),
-      revoke: (capId: string) =>
-        PolicyModule.revokeCap(capId, signer, client, config.packageId),
-      get: (capId: string) =>
-        PolicyModule.getCap(client, capId),
-      checkAuthorization: (capId: string, moduleName: string, amount: bigint) =>
-        PolicyModule.checkAuthorization(client, capId, moduleName, amount),
-    };
-  }
-
-  // ── HTTP payment rail ───────────────────────────────────────────────────────
-
-  get payments() {
-    const { client, signer, config } = this;
-    return {
-      createRequest: (params: Parameters<typeof X402Module.createPaymentRequest>[0]) =>
-        X402Module.createPaymentRequest(params, signer, client, config.packageId),
-      fulfill: (requestId: string) =>
-        X402Module.fulfillRequest(requestId, signer, client, config.packageId),
-      verifyReceipt: (receiptId: string, requestId: string) =>
-        X402Module.verifyReceipt(client, receiptId, requestId),
-      middleware: (options: Parameters<typeof X402Module.sui402Middleware>[0]) =>
-        X402Module.sui402Middleware(options),
-    };
-  }
-
-  // ── Reputation ──────────────────────────────────────────────────────────────
-
-  get reputation() {
-    const { client, signer, config } = this;
-    return {
-      init: (agentId: string, stakeMist: bigint) =>
-        ReputationModule.initReputation(agentId, stakeMist, signer, client, config.packageId),
-      attest: (params: Parameters<typeof ReputationModule.attest>[0]) =>
-        ReputationModule.attest(params, signer, client, config.packageId),
-      getRecord: (recordId: string) =>
-        ReputationModule.getReputationRecord(client, recordId),
-      getScore: (recordId: string) =>
-        ReputationModule.getScore(client, recordId),
-    };
-  }
-
-  // ── Task market ─────────────────────────────────────────────────────────────
-
-  get tasks() {
-    const { client, signer, config } = this;
-    return {
-      post: (params: Parameters<typeof TaskModule.postTask>[0]) =>
-        TaskModule.postTask(params, signer, client, config.packageId, config.taskBoardId),
-      claim: (taskId: string, agentId: string, reputationId: string) =>
-        TaskModule.claimTask(taskId, agentId, reputationId, signer, client, config.packageId),
-      fulfill: (taskId: string, resultBlob: string) =>
-        TaskModule.fulfillTask(taskId, resultBlob, signer, client, config.packageId),
-      accept: (taskId: string) =>
-        TaskModule.acceptResult(taskId, signer, client, config.packageId),
-      dispute: (taskId: string) =>
-        TaskModule.disputeTask(taskId, signer, client, config.packageId),
-      getOpen: (capability?: string) =>
-        TaskModule.getOpenTasks(client, config.taskBoardId, capability),
-      getByAgent: (agentId: string) =>
-        TaskModule.getTasksByAgent(client, agentId),
-    };
-  }
-
-  // ── Payment streams ─────────────────────────────────────────────────────────
-
-  get streams() {
-    const { client, signer, config } = this;
-    return {
-      open: (params: Parameters<typeof StreamModule.openStream>[0]) =>
-        StreamModule.openStream(params, signer, client, config.packageId),
-      claim: (streamId: string) =>
-        StreamModule.claimStream(streamId, signer, client, config.packageId),
-      topUp: (streamId: string, amount: bigint) =>
-        StreamModule.topUp(streamId, amount, signer, client, config.packageId),
-      close: (streamId: string) =>
-        StreamModule.closeStream(streamId, signer, client, config.packageId),
-      getBalance: (streamId: string) =>
-        StreamModule.getStreamBalance(client, streamId),
-    };
-  }
-
-  // ── Agent-to-agent messaging ────────────────────────────────────────────────
-
-  get messages() {
-    const { client, signer, config } = this;
-    return {
-      send: (params: Parameters<typeof A2AModule.sendMessage>[0]) =>
-        A2AModule.sendMessage(params, signer, client, config.packageId),
-      acknowledge: (msgId: string, payloadBlob: string) =>
-        A2AModule.acknowledgeMessage(msgId, payloadBlob, signer, client, config.packageId),
-      getInbox: (address: string) =>
-        A2AModule.getInbox(client, address),
-      getPendingAcks: (agentId: string) =>
-        A2AModule.getPendingAcks(client, agentId),
-    };
-  }
-
-  // ── Agent memory ────────────────────────────────────────────────────────────
-
-  get memory() {
-    const { client, signer, config } = this;
-    return {
-      store: (params: Parameters<typeof MemoryModule.storeMemory>[0]) =>
-        MemoryModule.storeMemory(params, signer, client, config.packageId),
-      get: (anchorId: string) =>
-        MemoryModule.getMemory(client, anchorId),
-      list: (agentId: string, type?: number) =>
-        MemoryModule.listAgentMemory(client, agentId, type),
-      verify: (anchorId: string, hash: Uint8Array) =>
-        MemoryModule.verifyMemoryIntegrity(client, anchorId, hash),
-      uploadToWalrus: (content: Uint8Array, epochs?: number) =>
-        MemoryModule.uploadToWalrus(content, epochs),
-    };
-  }
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022"],
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "outDir": "./dist",
+    "rootDir": "./src"
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist"]
 }
