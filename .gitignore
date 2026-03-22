@@ -1,0 +1,12 @@
+node_modules/
+dist/
+sdk/dist/
+move/build/
+*.tsbuildinfo
+package-lock.json
+.env
+.env.*
+.idea/
+.vscode/
+*.swp
+.DS_Store
