@@ -3,6 +3,7 @@ dist/
 sdk/dist/
 move/build/
 *.tsbuildinfo
+package-lock.json
 .env
 .env.*
 .idea/
