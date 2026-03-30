@@ -1,151 +1,223 @@
-# sui-agent-kit
+<p align="center">
+  <img src="assets/banner.svg" alt="sui-agent-kit" width="100%" />
+</p>
 
-The missing middleware layer between Sui's L1 primitives and real-world AI agent applications.
+<p align="center">
+  <strong>The missing middleware layer between Sui's L1 primitives and real-world AI agent applications.</strong>
+</p>
 
-Eight composable Move modules and a unified TypeScript SDK that give agents economic agency on-chain: identity, delegation, payments, reputation, task markets, streaming, messaging, and memory.
+<p align="center">
+  <a href="#modules">Modules</a> · <a href="#quickstart">Quickstart</a> · <a href="#architecture">Architecture</a> · <a href="#sdk">SDK</a> · <a href="#contributing">Contributing</a>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Sui-Move-4da2ff?style=flat-square" alt="Sui Move" />
+  <img src="https://img.shields.io/badge/TypeScript-SDK-3178c6?style=flat-square" alt="TypeScript" />
+  <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License" />
+</p>
 
 ---
 
-## The idea
+## What is this?
 
-On EVM, agent infrastructure is scattered across disconnected protocols — x402 for payments, ERC-8004 for identity, Google AP2 for delegation, A2A for messaging. Each lives in its own repo, its own runtime, its own trust model.
+**sui-agent-kit** is an open-source composable module layer for agentic economics on Sui — analogous to `x402 + ERC-8004 + Google AP2` on EVM, but native to Sui's object model.
 
-sui-agent-kit consolidates all of this into a single package deployed to Sui. Every agent, task, policy, and message is a first-class Sui object. Every operation — payment, delegation check, task assignment — composes inside a single Programmable Transaction Block. No routers, no multi-contract hops, no sequential bottlenecks.
-
-The canonical flow:
-
-```
-register → delegate → authorize → execute → attest → settle
-```
+It provides the foundational primitives that autonomous AI agents need to operate on-chain: identity, delegation, reputation, payments, task markets, messaging, and persistent memory. Every module is a standalone Move package that composes with the rest.
 
 ---
 
 ## Modules
 
-```
-move/sources/
-  sui_agent_id.move         Identity registry. VecSet capabilities, Walrus endpoint.
-  sui_agent_policy.move     DelegationCap with per-tx limits, daily budgets, epoch expiry.
-  sui_x402.move             HTTP 402 payment requests. Atomic fulfill, frozen receipts.
-  sui_reputation.move       Stake-weighted scoring. Attestation proofs between agents.
-  sui_task_market.move      Shared TaskBoard. Escrow via Balance<SUI>, reputation gating.
-  sui_stream.move           Epoch-based streaming payments. Open, claim, top-up, close.
-  sui_a2a.move              Agent-to-agent messages with attached SUI payment and TTL.
-  sui_memory.move           Walrus-anchored memory. Content hash verification on-chain.
-```
-
-```
-sdk/src/
-  client.ts                 SuiAgentKit — unified entry point.
-  agent.ts                  kit.agents.register() / .get() / .hasCapability()
-  policy.ts                 kit.policies.createCap() / .revoke() / .checkAuthorization()
-  x402.ts                   kit.payments.createRequest() / .fulfill() / .middleware()
-  reputation.ts             kit.reputation.init() / .attest() / .getScore()
-  task.ts                   kit.tasks.post() / .claim() / .fulfill() / .accept()
-  stream.ts                 kit.streams.open() / .claim() / .topUp() / .close()
-  a2a.ts                    kit.messages.send() / .acknowledge() / .getInbox()
-  memory.ts                 kit.memory.store() / .get() / .verify() / .uploadToWalrus()
-```
+| Module | Move Package | What it does |
+|--------|-------------|--------------|
+| **Agent Identity** | `sui_agent_identity` | Soulbound AgentCard objects with capabilities, metadata, and ownership |
+| **Delegation** | `sui_delegation` | Scoped permission grants between agents with expiry and spend limits |
+| **Task Market** | `sui_task_market` | Post, claim, fulfill, and dispute tasks with escrowed SUI rewards |
+| **Reputation** | `sui_reputation` | On-chain scoring updated by task outcomes and peer attestations |
+| **x402 Payments** | `sui_x402_pay` | HTTP 402-style micropayments and streaming payment channels |
+| **Messaging** | `sui_agent_messaging` | Agent-to-agent messaging with channels and typed payloads |
+| **Walrus Memory** | `sui_walrus_memory` | Persistent key-value memory backed by Walrus decentralized storage |
 
 ---
 
-## Why Sui and not EVM
+## Quickstart
 
-Sui objects are owned or shared — agents on disjoint state execute in parallel. `Balance<SUI>` gives you trustless escrow without a separate vault contract. PTBs bundle an entire workflow atomically: split coin, check policy, post task, attach payment, emit event — one transaction, one gas fee.
-
-Walrus handles the heavy payloads. Move handles the trust. The SDK handles the wiring.
-
----
-
-## Get started
-
-Deploy the contracts:
+### Install
 
 ```bash
-cd move && sui move build && sui client publish --gas-budget 500000000
+npm install @grxkun/sui-agent-kit
 ```
 
-Build the SDK:
+### Register an agent
+
+```typescript
+import { SuiAgentKit } from "@grxkun/sui-agent-kit";
+import { registerNetwork, createClient } from "@grxkun/sui-agent-kit/config";
+
+// 1. Register your deployed package addresses
+registerNetwork("testnet", {
+  agentIdentity: "0x...",
+  taskMarket: "0x...",
+  reputation: "0x...",
+});
+
+// 2. Initialize
+const client = createClient("testnet");
+const kit = new SuiAgentKit(client, keypair);
+
+// 3. Register
+const agent = await kit.registerAgent({
+  name: "DataFetcher",
+  capabilities: ["data", "api"],
+});
+```
+
+### Claim and fulfill a task
+
+```typescript
+import { retryWithBackoff, estimateGas } from "@grxkun/sui-agent-kit/utils";
+
+// Claim with automatic retry on network errors
+const result = await retryWithBackoff(
+  () => kit.claimTask({ taskId: "0x...", agentId: agent.id }),
+  { maxAttempts: 3 }
+);
+
+// Fulfill
+await kit.fulfillTask({
+  taskId: "0x...",
+  agentId: agent.id,
+  resultData: JSON.stringify({ price: 1.42 }),
+});
+```
+
+### Subscribe to events
+
+```typescript
+import { createEventHelpers } from "@grxkun/sui-agent-kit/utils";
+
+const events = createEventHelpers(client, PACKAGE_ID);
+
+events.onTaskPosted(async (task) => {
+  console.log("New task:", task.title);
+  if (task.capability === "data") {
+    await kit.claimTask({ taskId: task.id, agentId: myAgent.id });
+  }
+});
+
+// Cleanup
+events.destroy();
+```
+
+### Batch transactions
+
+```typescript
+import { BatchBuilder, batchClaimTasks } from "@grxkun/sui-agent-kit/utils";
+
+// Claim 5 tasks in a single PTB
+const calls = batchClaimTasks(PACKAGE_ID, taskIds, agentId, boardId);
+
+const batch = new BatchBuilder(client, signer)
+  .addAll(calls);
+
+const result = await batch.execute();
+```
+
+---
+
+## Architecture
+
+```
+┌──────────────────────────────────────────────────────┐
+│  AI Agent (LLM / Autonomous Loop)                    │
+├──────────────────────────────────────────────────────┤
+│  TypeScript SDK (@grxkun/sui-agent-kit)              │
+│  ┌──────────┬──────────┬──────────┬────────────────┐ │
+│  │  Retry   │   Gas    │  Events  │   Validation   │ │
+│  │  Engine  │  Estimator│  Sub    │   (Zod)        │ │
+│  └──────────┴──────────┴──────────┴────────────────┘ │
+├──────────────────────────────────────────────────────┤
+│  Move Modules (on-chain)                             │
+│  ┌─────────┬───────────┬──────────┬───────────────┐  │
+│  │Identity │ Delegation│  Tasks   │  Reputation   │  │
+│  ├─────────┼───────────┼──────────┼───────────────┤  │
+│  │ x402 Pay│ Messaging │  Memory  │   (Walrus)    │  │
+│  └─────────┴───────────┴──────────┴───────────────┘  │
+├──────────────────────────────────────────────────────┤
+│  Sui L1                                              │
+└──────────────────────────────────────────────────────┘
+```
+
+---
+
+## SDK Utilities
+
+The SDK ships with production-grade utilities that make the difference between a demo and a real deployment:
+
+**Error Handling & Retry** — Exponential backoff with jitter, automatic error classification (gas, network, object-not-found), and configurable retry policies.
+
+**Gas Estimation** — Dry-run simulation to compute exact gas costs with configurable buffers. No more default gas budgets that overpay or fail.
+
+**Event Subscriptions** — Polling-based event listener with cursor management, field-level filtering, and typed helpers for all kit events. Agents react to on-chain events instead of sleeping and polling raw RPC.
+
+**Input Validation** — Zod schemas for every SDK method. Malformed inputs get caught in TypeScript before they waste gas on a Move abort.
+
+**Transaction Batching** — Compose multiple Move calls into a single PTB. Claiming 10 tasks = 1 transaction.
+
+**Network Config** — Register package addresses per network. Switch between testnet and mainnet with one line.
+
+---
+
+## Project Structure
+
+```
+sui-agent-kit/
+├── move/
+│   ├── sui_agent_identity/     # AgentCard, capabilities
+│   ├── sui_delegation/         # Scoped permissions
+│   ├── sui_task_market/        # Task lifecycle + escrow
+│   ├── sui_reputation/         # On-chain scoring
+│   ├── sui_x402_pay/           # Micropayments, streams
+│   ├── sui_agent_messaging/    # Agent-to-agent comms
+│   └── sui_walrus_memory/      # Persistent KV store
+├── src/
+│   ├── config/
+│   │   └── networks.ts         # Network registry
+│   ├── utils/
+│   │   ├── retry.ts            # Error handling + backoff
+│   │   ├── gas.ts              # Gas estimation
+│   │   ├── events.ts           # Event subscriptions
+│   │   ├── validation.ts       # Zod schemas
+│   │   ├── batch.ts            # PTB batching
+│   │   └── index.ts            # Barrel export
+│   └── index.ts                # Main SDK entry
+├── assets/
+│   └── banner.svg
+└── package.json
+```
+
+---
+
+## Roadmap
+
+- [ ] MCP Server — expose agent operations as tools for Claude Desktop / Cursor
+- [ ] `npx create-sui-agent` scaffolding CLI
+- [ ] Capability Marketplace — browse, rent, compose audited capability modules
+- [ ] Cross-chain identity bridge (Wormhole-backed attestations)
+- [ ] Agent telemetry dashboard
+- [ ] Security sandbox with per-epoch gas limits
+
+---
+
+## Contributing
+
+PRs welcome. If you're building agents on Sui, this is your toolkit.
 
 ```bash
-cd sdk && npm install && npm run build
-```
-
-Register an agent:
-
-```ts
-import { SuiAgentKit } from "./sdk/src/index";
-import { Ed25519Keypair } from "@mysten/sui/keypairs/ed25519";
-
-const kit = new SuiAgentKit(keypair, {
-  packageId: "0x...",
-  agentRegistryId: "0x...",
-  taskBoardId: "0x...",
-  network: "testnet",
-});
-
-await kit.agents.register({
-  name: "TraderBot",
-  capabilities: ["trade", "data", "delegate"],
-  endpointBlob: "walrus://agent-card",
-  x402Support: true,
-});
-```
-
-Post a task, fulfill it, settle:
-
-```ts
-await kit.tasks.post({
-  title: "Analyze order flow",
-  descriptionBlob: "walrus://task-spec",
-  rewardMist: 1_000_000_000n,
-  requiredCapability: "data",
-  deadlineEpoch: 999999n,
-});
-
-await kit.tasks.claim(taskId, agentId, reputationId);
-await kit.tasks.fulfill(taskId, "walrus://result");
-await kit.tasks.accept(taskId); // releases escrow
-```
-
-Send a paid message between agents:
-
-```ts
-await kit.messages.send({
-  senderAgentCardId: myAgentId,
-  recipient: otherAgent,
-  intent: MessageIntent.Request,
-  payloadBlob: "walrus://payload",
-  paymentMist: 500_000_000n,
-  ttlEpoch: 100n,
-  requiresAck: true,
-});
-```
-
----
-
-## EVM equivalence
-
-| Concern | EVM | sui-agent-kit |
-|---|---|---|
-| Identity | ERC-8004 registry | `AgentCard` owned objects, `VecSet` capabilities |
-| Delegation | AP2 off-chain auth | `DelegationCap` with on-chain epoch budgets |
-| Payments | x402 + ERC-20 approve | `Coin<SUI>` in PTBs, `Balance<T>` escrow |
-| Reputation | Off-chain oracles | Stake-weighted `ReputationRecord` + frozen `Attestation` |
-| Tasks | Custom contracts | `TaskBoard` shared object, escrow + gating |
-| Streaming | Sablier / Superfluid | `PaymentStream` with epoch-rate claims |
-| Messaging | A2A over HTTP | `AgentMessage` objects with payment + TTL |
-| Memory | IPFS + external DB | Walrus blob + `MemoryAnchor` hash verification |
-
----
-
-## Project structure
-
-```
-move/sources/         8 Move modules — the on-chain layer
-sdk/src/              TypeScript SDK — wraps every module
-examples/             Working examples for testnet
-.github/              Copilot instructions, CI
+git clone https://github.com/grxkun/sui-agent-kit.git
+cd sui-agent-kit
+pnpm install
+pnpm build
 ```
 
 ---
@@ -153,3 +225,4 @@ examples/             Working examples for testnet
 ## License
 
 MIT
+
