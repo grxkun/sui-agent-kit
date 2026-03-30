@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/banner.svg" alt="sui-agent-kit" width="100%" />
+  <img src="assets/banner.png" alt="sui-agent-kit" width="100%" />
 </p>
 
 <p align="center">
