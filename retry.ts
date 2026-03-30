@@ -1,160 +1,246 @@
 /**
- * @module retry
- * Error handling utilities with exponential backoff for Sui transactions.
+ * @module events
+ * Event subscription system for Sui on-chain events.
+ * Enables reactive agents that respond to TaskPosted, ReputationChanged, etc.
  */
 
-// ── Error Types ──────────────────────────────────────────────────────────────
+import type { SuiClient, SuiEvent, EventId } from "@mysten/sui/client";
 
-export class SuiAgentError extends Error {
-  constructor(
-    message: string,
-    public readonly code: string,
-    public readonly cause?: unknown
-  ) {
-    super(message);
-    this.name = "SuiAgentError";
+// ── Types ────────────────────────────────────────────────────────────────────
+
+export interface EventFilter {
+  /** Move event type, e.g. "0x...::sui_task_market::TaskPosted" */
+  eventType: string;
+  /** Optional field-level filter on parsed JSON */
+  match?: Record<string, unknown>;
+}
+
+export type EventHandler = (event: SuiEvent) => void | Promise<void>;
+
+export interface SubscriptionOptions {
+  /** Polling interval in ms (default: 2000) */
+  pollIntervalMs?: number;
+  /** Start from this cursor (default: latest) */
+  startCursor?: EventId;
+  /** Max events per poll (default: 50) */
+  limit?: number;
+  /** Error callback */
+  onError?: (error: Error) => void;
+}
+
+interface ActiveSubscription {
+  filter: EventFilter;
+  handler: EventHandler;
+  options: Required<SubscriptionOptions>;
+  cursor: EventId | null;
+  timer: ReturnType<typeof setInterval> | null;
+  active: boolean;
+}
+
+// ── Event Subscriber ─────────────────────────────────────────────────────────
+
+export class EventSubscriber {
+  private subscriptions = new Map<string, ActiveSubscription>();
+  private subCounter = 0;
+
+  constructor(private readonly client: SuiClient) {}
+
+  /**
+   * Subscribe to a Sui Move event type with optional field-level filtering.
+   *
+   * @returns Subscription ID — pass to `unsubscribe()` to stop.
+   *
+   * @example
+   * ```ts
+   * const sub = subscriber.on(
+   *   { eventType: `${PKG}::sui_task_market::TaskPosted` },
+   *   async (event) => {
+   *     const task = event.parsedJson as TaskPostedEvent;
+   *     if (task.capability === "data") {
+   *       await claimTask(task.id);
+   *     }
+   *   }
+   * );
+   * ```
+   */
+  on(filter: EventFilter, handler: EventHandler, options?: SubscriptionOptions): string {
+    const id = `sub_${++this.subCounter}`;
+    const opts: Required<SubscriptionOptions> = {
+      pollIntervalMs: options?.pollIntervalMs ?? 2000,
+      startCursor: options?.startCursor ?? (null as unknown as EventId),
+      limit: options?.limit ?? 50,
+      onError: options?.onError ?? ((err) => console.error(`[sui-agent-kit] Event error:`, err)),
+    };
+
+    const sub: ActiveSubscription = {
+      filter,
+      handler,
+      options: opts,
+      cursor: opts.startCursor || null,
+      timer: null,
+      active: true,
+    };
+
+    sub.timer = setInterval(() => this.poll(id), opts.pollIntervalMs);
+    this.subscriptions.set(id, sub);
+
+    // Fire immediate first poll
+    this.poll(id);
+
+    return id;
   }
-}
 
-export class InsufficientGasError extends SuiAgentError {
-  constructor(cause?: unknown) {
-    super("Insufficient gas for transaction", "INSUFFICIENT_GAS", cause);
-    this.name = "InsufficientGasError";
+  /**
+   * Stop a subscription.
+   */
+  unsubscribe(subscriptionId: string): boolean {
+    const sub = this.subscriptions.get(subscriptionId);
+    if (!sub) return false;
+
+    sub.active = false;
+    if (sub.timer) clearInterval(sub.timer);
+    this.subscriptions.delete(subscriptionId);
+    return true;
   }
-}
 
-export class NetworkError extends SuiAgentError {
-  constructor(message: string, cause?: unknown) {
-    super(message, "NETWORK_ERROR", cause);
-    this.name = "NetworkError";
-  }
-}
-
-export class TransactionFailedError extends SuiAgentError {
-  constructor(
-    message: string,
-    public readonly digest?: string,
-    cause?: unknown
-  ) {
-    super(message, "TX_FAILED", cause);
-    this.name = "TransactionFailedError";
-  }
-}
-
-export class ObjectNotFoundError extends SuiAgentError {
-  constructor(objectId: string, cause?: unknown) {
-    super(`Object not found: ${objectId}`, "OBJECT_NOT_FOUND", cause);
-    this.name = "ObjectNotFoundError";
-  }
-}
-
-// ── Error Classification ─────────────────────────────────────────────────────
-
-export function isRetryable(err: unknown): boolean {
-  if (err instanceof InsufficientGasError) return false;
-  if (err instanceof ObjectNotFoundError) return false;
-  if (err instanceof NetworkError) return true;
-
-  const message = err instanceof Error ? err.message : String(err);
-  const retryablePatterns = [
-    "ECONNRESET",
-    "ECONNREFUSED",
-    "ETIMEDOUT",
-    "socket hang up",
-    "429",
-    "503",
-    "502",
-    "rate limit",
-  ];
-  return retryablePatterns.some((p) => message.toLowerCase().includes(p.toLowerCase()));
-}
-
-export function classifyError(err: unknown): SuiAgentError {
-  const message = err instanceof Error ? err.message : String(err);
-  const lower = message.toLowerCase();
-
-  if (lower.includes("insufficient") && lower.includes("gas")) {
-    return new InsufficientGasError(err);
-  }
-  if (lower.includes("object") && lower.includes("not found")) {
-    return new ObjectNotFoundError("unknown", err);
-  }
-  if (
-    lower.includes("econnreset") ||
-    lower.includes("econnrefused") ||
-    lower.includes("etimedout") ||
-    lower.includes("fetch failed")
-  ) {
-    return new NetworkError(message, err);
-  }
-  return new SuiAgentError(message, "UNKNOWN", err);
-}
-
-// ── Retry Logic ──────────────────────────────────────────────────────────────
-
-export interface RetryOptions {
-  /** Max number of attempts (default: 3) */
-  maxAttempts?: number;
-  /** Base delay in ms (default: 500) */
-  baseDelay?: number;
-  /** Maximum delay cap in ms (default: 10000) */
-  maxDelay?: number;
-  /** Jitter factor 0-1 (default: 0.2) */
-  jitter?: number;
-  /** Callback fired on each retry */
-  onRetry?: (attempt: number, error: SuiAgentError, nextDelayMs: number) => void;
-}
-
-const RETRY_DEFAULTS: Required<Omit<RetryOptions, "onRetry">> = {
-  maxAttempts: 3,
-  baseDelay: 500,
-  maxDelay: 10_000,
-  jitter: 0.2,
-};
-
-function computeDelay(attempt: number, opts: Required<Omit<RetryOptions, "onRetry">>): number {
-  const exponential = opts.baseDelay * Math.pow(2, attempt);
-  const capped = Math.min(exponential, opts.maxDelay);
-  const jitterRange = capped * opts.jitter;
-  return capped + (Math.random() * jitterRange * 2 - jitterRange);
-}
-
-/**
- * Execute an async function with exponential backoff retry.
- *
- * @example
- * ```ts
- * const result = await retryWithBackoff(
- *   () => client.signAndExecuteTransaction({ transaction: tx, signer }),
- *   { maxAttempts: 3, onRetry: (n, err) => console.warn(`Retry ${n}:`, err.message) }
- * );
- * ```
- */
-export async function retryWithBackoff<T>(
-  fn: () => Promise<T>,
-  options?: RetryOptions
-): Promise<T> {
-  const opts = { ...RETRY_DEFAULTS, ...options };
-
-  for (let attempt = 0; attempt < opts.maxAttempts; attempt++) {
-    try {
-      return await fn();
-    } catch (raw) {
-      const err = raw instanceof SuiAgentError ? raw : classifyError(raw);
-
-      // Don't retry non-retryable errors
-      if (!isRetryable(err)) throw err;
-
-      // Don't retry on last attempt
-      if (attempt === opts.maxAttempts - 1) throw err;
-
-      const delay = computeDelay(attempt, opts);
-      options?.onRetry?.(attempt + 1, err, delay);
-
-      await new Promise((r) => setTimeout(r, delay));
+  /**
+   * Stop all subscriptions.
+   */
+  unsubscribeAll(): void {
+    for (const [id] of this.subscriptions) {
+      this.unsubscribe(id);
     }
   }
 
-  // Unreachable but satisfies TS
-  throw new SuiAgentError("Retry exhausted", "RETRY_EXHAUSTED");
+  /**
+   * Get count of active subscriptions.
+   */
+  get activeCount(): number {
+    return this.subscriptions.size;
+  }
+
+  // ── Internal ───────────────────────────────────────────────────────────────
+
+  private async poll(subId: string): Promise<void> {
+    const sub = this.subscriptions.get(subId);
+    if (!sub || !sub.active) return;
+
+    try {
+      const { data, nextCursor, hasNextPage } = await this.client.queryEvents({
+        query: { MoveEventType: sub.filter.eventType },
+        cursor: sub.cursor ?? undefined,
+        limit: sub.options.limit,
+        order: "ascending",
+      });
+
+      for (const event of data) {
+        // Apply field-level filter if provided
+        if (sub.filter.match && !this.matchesFilter(event, sub.filter.match)) {
+          continue;
+        }
+
+        try {
+          await sub.handler(event);
+        } catch (handlerErr) {
+          sub.options.onError(
+            handlerErr instanceof Error
+              ? handlerErr
+              : new Error(String(handlerErr))
+          );
+        }
+      }
+
+      // Advance cursor
+      if (nextCursor) {
+        sub.cursor = nextCursor;
+      }
+
+      // If there's more data, poll again immediately
+      if (hasNextPage && sub.active) {
+        await this.poll(subId);
+      }
+    } catch (err) {
+      sub.options.onError(err instanceof Error ? err : new Error(String(err)));
+    }
+  }
+
+  private matchesFilter(event: SuiEvent, match: Record<string, unknown>): boolean {
+    const parsed = event.parsedJson as Record<string, unknown> | undefined;
+    if (!parsed) return false;
+
+    return Object.entries(match).every(([key, value]) => parsed[key] === value);
+  }
+}
+
+// ── Convenience: Typed Event Helpers ─────────────────────────────────────────
+
+/**
+ * Create a typed event subscription helper for a specific package.
+ *
+ * @example
+ * ```ts
+ * const events = createEventHelpers(client, PACKAGE_ID);
+ * events.onTaskPosted((task) => console.log("New task:", task.title));
+ * ```
+ */
+export function createEventHelpers(client: SuiClient, packageId: string) {
+  const subscriber = new EventSubscriber(client);
+  const eventType = (module: string, event: string) =>
+    `${packageId}::${module}::${event}`;
+
+  return {
+    subscriber,
+
+    onTaskPosted(handler: (data: Record<string, unknown>) => void | Promise<void>, opts?: SubscriptionOptions) {
+      return subscriber.on(
+        { eventType: eventType("sui_task_market", "TaskPosted") },
+        (e) => handler(e.parsedJson as Record<string, unknown>),
+        opts
+      );
+    },
+
+    onTaskClaimed(handler: (data: Record<string, unknown>) => void | Promise<void>, opts?: SubscriptionOptions) {
+      return subscriber.on(
+        { eventType: eventType("sui_task_market", "TaskClaimed") },
+        (e) => handler(e.parsedJson as Record<string, unknown>),
+        opts
+      );
+    },
+
+    onTaskFulfilled(handler: (data: Record<string, unknown>) => void | Promise<void>, opts?: SubscriptionOptions) {
+      return subscriber.on(
+        { eventType: eventType("sui_task_market", "TaskFulfilled") },
+        (e) => handler(e.parsedJson as Record<string, unknown>),
+        opts
+      );
+    },
+
+    onReputationChanged(handler: (data: Record<string, unknown>) => void | Promise<void>, opts?: SubscriptionOptions) {
+      return subscriber.on(
+        { eventType: eventType("sui_reputation", "ReputationChanged") },
+        (e) => handler(e.parsedJson as Record<string, unknown>),
+        opts
+      );
+    },
+
+    onPaymentReceived(handler: (data: Record<string, unknown>) => void | Promise<void>, opts?: SubscriptionOptions) {
+      return subscriber.on(
+        { eventType: eventType("sui_x402_pay", "PaymentReceived") },
+        (e) => handler(e.parsedJson as Record<string, unknown>),
+        opts
+      );
+    },
+
+    onAgentRegistered(handler: (data: Record<string, unknown>) => void | Promise<void>, opts?: SubscriptionOptions) {
+      return subscriber.on(
+        { eventType: eventType("sui_agent_identity", "AgentRegistered") },
+        (e) => handler(e.parsedJson as Record<string, unknown>),
+        opts
+      );
+    },
+
+    destroy() {
+      subscriber.unsubscribeAll();
+    },
+  };
 }
