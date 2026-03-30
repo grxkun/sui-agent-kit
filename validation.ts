@@ -1,147 +1,115 @@
 /**
- * @module validation
- * Zod schemas for input validation across the SDK.
- * Validates inputs before they hit Move — saves gas on reverts.
+ * @module gas
+ * Smart gas estimation for Sui transactions via dry-run simulation.
  */
 
-import { z } from "zod";
+import type { SuiClient, DryRunTransactionBlockResponse } from "@mysten/sui/client";
+import type { Transaction } from "@mysten/sui/transactions";
 
-// ── Primitives ───────────────────────────────────────────────────────────────
+// ── Types ────────────────────────────────────────────────────────────────────
 
-/** Valid Sui address (0x + 64 hex chars) */
-export const SuiAddress = z
-  .string()
-  .regex(/^0x[a-fA-F0-9]{64}$/, "Invalid Sui address: must be 0x + 64 hex characters");
+export interface GasEstimate {
+  /** Computation cost in MIST */
+  computationCost: bigint;
+  /** Storage cost in MIST */
+  storageCost: bigint;
+  /** Storage rebate in MIST */
+  storageRebate: bigint;
+  /** Net gas cost (computation + storage - rebate) */
+  netCost: bigint;
+  /** Recommended budget with buffer applied */
+  recommendedBudget: bigint;
+}
 
-/** Valid Sui object ID */
-export const ObjectId = SuiAddress;
+export interface EstimateOptions {
+  /** Buffer multiplier (default: 1.2 = 20% headroom) */
+  bufferMultiplier?: number;
+  /** Minimum gas budget in MIST (default: 10_000_000 = 0.01 SUI) */
+  minBudget?: bigint;
+  /** Sender address override for dry run */
+  sender?: string;
+}
 
-/** Package ID */
-export const PackageId = SuiAddress;
-
-/** Positive SUI amount in MIST */
-export const MistAmount = z.bigint().positive("Amount must be positive");
-
-/** Positive SUI amount as number (converted to MIST internally) */
-export const SuiAmount = z.number().positive("SUI amount must be positive");
-
-/** Non-empty trimmed string with max length */
-const boundedString = (max: number) =>
-  z.string().trim().min(1, "Cannot be empty").max(max, `Max ${max} characters`);
-
-// ── Agent Identity ───────────────────────────────────────────────────────────
-
-export const RegisterAgentSchema = z.object({
-  name: boundedString(100),
-  description: boundedString(500).optional(),
-  capabilities: z
-    .array(z.string().trim().min(1).max(50))
-    .min(1, "At least one capability required")
-    .max(20, "Max 20 capabilities"),
-  endpoint: z.string().url("Must be a valid URL").optional(),
-  metadata: z.record(z.string(), z.string()).optional(),
-});
-
-export type RegisterAgentParams = z.infer<typeof RegisterAgentSchema>;
-
-// ── Delegation ───────────────────────────────────────────────────────────────
-
-export const CreateDelegationSchema = z.object({
-  agentId: ObjectId,
-  delegateTo: SuiAddress,
-  permissions: z
-    .array(z.string().trim().min(1).max(50))
-    .min(1, "At least one permission required"),
-  expiresAt: z.number().int().positive().optional(),
-  maxSpend: MistAmount.optional(),
-});
-
-export type CreateDelegationParams = z.infer<typeof CreateDelegationSchema>;
-
-// ── Task Market ──────────────────────────────────────────────────────────────
-
-export const PostTaskSchema = z.object({
-  title: boundedString(200),
-  description: boundedString(2000),
-  requiredCapability: z.string().trim().min(1).max(50),
-  rewardAmount: MistAmount,
-  deadline: z.number().int().positive("Deadline must be a future epoch timestamp"),
-  minReputationScore: z.number().int().min(0).max(10000).default(0),
-});
-
-export type PostTaskParams = z.infer<typeof PostTaskSchema>;
-
-export const ClaimTaskSchema = z.object({
-  taskId: ObjectId,
-  agentId: ObjectId,
-});
-
-export type ClaimTaskParams = z.infer<typeof ClaimTaskSchema>;
-
-export const FulfillTaskSchema = z.object({
-  taskId: ObjectId,
-  agentId: ObjectId,
-  resultData: boundedString(5000),
-});
-
-export type FulfillTaskParams = z.infer<typeof FulfillTaskSchema>;
-
-// ── Reputation ───────────────────────────────────────────────────────────────
-
-export const UpdateReputationSchema = z.object({
-  agentId: ObjectId,
-  delta: z.number().int(),
-  reason: boundedString(200),
-});
-
-export type UpdateReputationParams = z.infer<typeof UpdateReputationSchema>;
-
-// ── Payments / x402 ──────────────────────────────────────────────────────────
-
-export const StreamPaymentSchema = z.object({
-  recipient: SuiAddress,
-  totalAmount: MistAmount,
-  intervalMs: z.number().int().min(1000, "Minimum 1s interval"),
-  durationMs: z.number().int().min(1000, "Minimum 1s duration"),
-});
-
-export type StreamPaymentParams = z.infer<typeof StreamPaymentSchema>;
-
-// ── Walrus Memory ────────────────────────────────────────────────────────────
-
-export const StoreMemorySchema = z.object({
-  agentId: ObjectId,
-  key: boundedString(200),
-  value: z.string().max(50_000, "Max 50KB per memory entry"),
-  ttl: z.number().int().positive().optional(),
-});
-
-export type StoreMemoryParams = z.infer<typeof StoreMemorySchema>;
-
-// ── Messaging ────────────────────────────────────────────────────────────────
-
-export const SendMessageSchema = z.object({
-  from: ObjectId,
-  to: ObjectId,
-  channel: boundedString(100),
-  payload: z.string().max(10_000, "Max 10KB message payload"),
-  replyTo: ObjectId.optional(),
-});
-
-export type SendMessageParams = z.infer<typeof SendMessageSchema>;
-
-// ── Validation Helper ────────────────────────────────────────────────────────
+// ── Gas Estimation ───────────────────────────────────────────────────────────
 
 /**
- * Validate input against a schema, returning a typed result.
- * Throws `ZodError` with formatted messages on failure.
+ * Estimate gas for a transaction via dry-run simulation.
  *
  * @example
  * ```ts
- * const params = validate(RegisterAgentSchema, rawInput);
- * // params is fully typed as RegisterAgentParams
+ * const estimate = await estimateGas(client, tx, senderAddress);
+ * tx.setGasBudget(estimate.recommendedBudget);
  * ```
  */
-export function validate<T>(schema: z.ZodSchema<T>, data: unknown): T {
-  return schema.parse(data);
+export async function estimateGas(
+  client: SuiClient,
+  tx: Transaction,
+  sender: string,
+  options?: EstimateOptions
+): Promise<GasEstimate> {
+  const { bufferMultiplier = 1.2, minBudget = 10_000_000n } = options ?? {};
+
+  tx.setSender(options?.sender ?? sender);
+
+  const txBytes = await tx.build({ client });
+  const dryRun: DryRunTransactionBlockResponse = await client.dryRunTransactionBlock({
+    transactionBlock: txBytes,
+  });
+
+  if (dryRun.effects.status.status !== "success") {
+    throw new Error(
+      `Dry run failed: ${dryRun.effects.status.error ?? "unknown error"}`
+    );
+  }
+
+  const gasUsed = dryRun.effects.gasUsed;
+  const computationCost = BigInt(gasUsed.computationCost);
+  const storageCost = BigInt(gasUsed.storageCost);
+  const storageRebate = BigInt(gasUsed.storageRebate);
+  const netCost = computationCost + storageCost - storageRebate;
+
+  // Apply buffer and enforce minimum
+  const buffered = BigInt(Math.ceil(Number(netCost) * bufferMultiplier));
+  const recommendedBudget = buffered > minBudget ? buffered : minBudget;
+
+  return {
+    computationCost,
+    storageCost,
+    storageRebate,
+    netCost,
+    recommendedBudget,
+  };
+}
+
+/**
+ * Apply estimated gas budget directly to a transaction.
+ * Convenience wrapper around `estimateGas`.
+ */
+export async function applyGasBudget(
+  client: SuiClient,
+  tx: Transaction,
+  sender: string,
+  options?: EstimateOptions
+): Promise<GasEstimate> {
+  const estimate = await estimateGas(client, tx, sender, options);
+  tx.setGasBudget(estimate.recommendedBudget);
+  return estimate;
+}
+
+// ── Gas Formatting ───────────────────────────────────────────────────────────
+
+/** Convert MIST to SUI (1 SUI = 1e9 MIST) */
+export function mistToSui(mist: bigint): number {
+  return Number(mist) / 1_000_000_000;
+}
+
+/** Format a GasEstimate for logging */
+export function formatGasEstimate(estimate: GasEstimate): string {
+  return [
+    `Computation: ${mistToSui(estimate.computationCost).toFixed(6)} SUI`,
+    `Storage:     ${mistToSui(estimate.storageCost).toFixed(6)} SUI`,
+    `Rebate:      ${mistToSui(estimate.storageRebate).toFixed(6)} SUI`,
+    `Net:         ${mistToSui(estimate.netCost).toFixed(6)} SUI`,
+    `Budget:      ${mistToSui(estimate.recommendedBudget).toFixed(6)} SUI`,
+  ].join("\n");
 }
